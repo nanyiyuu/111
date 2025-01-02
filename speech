@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+<launch>
+    <!-- 启动语音处理节点 -->
+    <node pkg="speech_processing" type="speech_processing_node.py" name="speech_processing_node" output="screen">
+        <!-- 配置Vosk模型路径 -->
+        <param name="model_path" value="$(find speech_processing)/models/vosk-model-small-en-us-0.15"/>
+    </node>
+
+    <!-- 启动sound_play节点（假设已在本地安装，无需额外下载） -->
+    <node pkg="sound_play" type="soundplay_node.py" name="sound_play" output="screen"/>
+</launch>
 
 import rospy
 from std_msgs.msg import String
