@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+
+import rospy
+from std_msgs.msg import String
+from sound_play.libsoundplay import SoundClient
+import sounddevice as sd
+import queue
+import json
+import os
+from vosk import Model, KaldiRecognizer
+import threading
+
+class SpeechProcessingNode:
+    def __init__(self):
+        rospy.init_node('speech_processing_node')
+
+        # Publisher for speech to text
+        self.pub = rospy.Publisher('speech_to_text', String, queue_size=10)
+
+        # Subscriber for text to speech
+        rospy.Subscriber('text_to_speech', String, self.tts_callback)
+
+        # Initialize sound client
+        self.soundhandle = SoundClient()
+        rospy.sleep(1)  # Wait for sound_play to initialize
+
+        rospy.loginfo("Speech Processing Node Initialized")
+
+        # Initialize Vosk model
+        model_path = rospy.get_param('~model_path', os.path.expanduser('~/catkin_ws/src/speech_processing/models/vosk-model-small-en-us-0.15'))
+        if not os.path.exists(model_path):
+            rospy.logerr(f"Vosk model not found at {model_path}")
+            rospy.signal_shutdown("Vosk model not found")
+            return
+
+        self.model = Model(model_path)
+        self.recognizer = KaldiRecognizer(self.model, 16000)
+
+        # Initialize audio stream
+        self.q = queue.Queue()
+        self.stream = sd.RawInputStream(samplerate=16000, blocksize=8000, dtype='int16',
+                                       channels=1, callback=self.audio_callback)
+        self.stream.start()
+
+        # Start a thread to process audio
+        self.processing_thread = threading.Thread(target=self.process_audio)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+
+    def audio_callback(self, indata, frames, time, status):
+        if status:
+            rospy.logwarn(f"Audio stream status: {status}")
+        self.q.put(bytes(indata))
+
+    def process_audio(self):
+        while not rospy.is_shutdown():
+            data = self.q.get()
+            if self.recognizer.AcceptWaveform(data):
+                result = self.recognizer.Result()
+                text = json.loads(result).get('text', '')
+                if text:
+                    rospy.loginfo(f"Recognized text: {text}")
+                    self.pub.publish(text)
+            else:
+                partial = self.recognizer.PartialResult()
+                # 可选：处理部分结果
+
+    def tts_callback(self, msg):
+        text = msg.data
+        rospy.loginfo(f"Converting text to speech: {text}")
+        self.play_text(text)
+
+    def play_text(self, text):
+        # 使用sound_play播放文本
+        self.soundhandle.say(text)
+        rospy.loginfo("Text-to-Speech completed.")
+
+if __name__ == "__main__":
+    try:
+        node = SpeechProcessingNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
