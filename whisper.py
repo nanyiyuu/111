@@ -1,35 +1,27 @@
-58844db3
-188eb4c9501f1143e59c2328a2792099
-
-
-#!/usr/bin/env python3
-# -*- encoding:utf-8 -*-
-# 2020/2/19   修改人员：monster water
+#!/usr/bin/env python3 
 
 """
-recognizer.py 是科大讯飞语音识别的ROS节点包装器。
+recognizer.py 是基于 Whisper 的语音识别封装。
   参数:
-    ~mic_name - 设置麦克风输入的pulsesrc设备名称。
-                例如，Logitech G35耳机的设备名称为：alsa_input.usb-Logitech_Logitech_G35_Headset-00-Headset_1.analog-mono
-                要在终端中列出音频设备信息，请输入：pacmd list-sources
-    ~appid - 您的科大讯飞应用ID
-    ~api_key - 您的科大讯飞API Key
-    ~api_secret - 您的科大讯飞API Secret
+    ~mic_name - 设置用于麦克风输入的 pulsesrc 设备名称。
+               例如，一个 Logitech G35 耳机的设备名称为: alsa_input.usb-Logitech_Logitech_G35_Headset-00-Headset_1.analog-mono
+               要在你的机器上列出音频设备信息，请在终端中输入: pacmd list-sources
   发布:
-    ~output (std_msgs/String) - 文字输出
+    ~output (std_msgs/String) - 文本输出
   服务:
-    ~start (std_srvs/Empty) - 启动语音识别
+    ~start (std_srvs/Empty) - 开始语音识别
     ~stop (std_srvs/Empty) - 停止语音识别
 """
 
 import rospy
+
 from gi import pygtkcompat
 import gi
 gi.require_version('Gst', '1.0')
+
 from gi.repository import GObject, Gst
 Gst.init(None)
 gst = Gst
-
 pygtkcompat.enable()
 pygtkcompat.enable_gtk(version='3.0')
 import gtk
@@ -39,331 +31,170 @@ from std_srvs.srv import Empty, EmptyResponse
 
 import os
 import numpy as np
-import json
-import base64
-import hashlib
-import time
-import hmac
-import requests
-import websocket
-import threading
-from urllib.parse import quote
 
-# 配置日志
-import logging
-logging.basicConfig()
+# 导入 Whisper 依赖
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+import torch
 
-# 科大讯飞 WebSocket 端点
-base_url = "wss://rtasr.xfyun.cn/v1/ws"
-
-# 结束标志
-end_tag = "{\"end\": true}"
-
-class IFLYTEKSpeechRecognizer:
-    """ 科大讯飞语音识别客户端。 """
-
-    def __init__(self, app_id, api_key, api_secret, publish_callback):
-        self.app_id = app_id
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.publish_callback = publish_callback  # 回调函数用于发布识别结果
-
-        self.ws = None
-        self.thread = None
-        self.stop_event = threading.Event()
-
-        self.connect()
-
-    def connect(self):
-        """ 连接到科大讯飞的 WebSocket 服务 """
-        ts = str(int(time.time()))
-        tmp = self.app_id + ts
-        hl = hashlib.md5()
-        hl.update(tmp.encode(encoding='utf-8'))
-        h2 = hl.hexdigest()
-        apikey = self.api_key.encode('utf-8')
-        h2 = h2.encode('utf-8')
-        my_sign = hmac.new(apikey, h2, hashlib.sha1).digest()
-        signa = base64.b64encode(my_sign).decode('utf-8')
-
-        ws_url = f"{base_url}?appid={self.app_id}&ts={ts}&signa={quote(signa)}"
-
-        # 创建WebSocket连接
-        self.ws = websocket.WebSocketApp(
-            ws_url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-
-        # 启动WebSocket线程
-        self.thread = threading.Thread(target=self.ws.run_forever)
-        self.thread.start()
-
-    def on_open(self, ws):
-        rospy.loginfo("WebSocket连接已打开。")
-        # 可以在此处发送一些初始化信息，如果需要的话
-        # 例如：发送配置参数
-        config = {
-            "common": {
-                "app_id": self.app_id,
-                "engine_type": "sms16k",  # 引擎类型，根据需求选择
-                "aue": "raw"
-            },
-            "business": {
-                "language": "zh_cn",
-                "domain": "iat",
-                "accent": "mandarin",
-                "vinfo": 1,
-                "vad_eos": 1000
-            },
-            "data": {
-                "status": 0,
-                "format": "audio/L16;rate=16000",
-                "encoding": "raw"
-            }
-        }
-        ws.send(json.dumps(config))
-
-    def on_message(self, ws, message):
-        """ 处理服务器返回的消息 """
-        try:
-            result_dict = json.loads(message)
-        except json.JSONDecodeError:
-            rospy.logwarn(f"无法解析的消息: {message}")
-            return
-
-        # 解析结果
-        if result_dict.get("action") == "started":
-            rospy.loginfo("握手成功，开始识别。")
-
-        elif result_dict.get("action") == "result":
-            if "data" in result_dict:
-                result_data = result_dict["data"]
-                if "result" in result_data:
-                    # 解析识别结果
-                    ws_result = json.loads(result_data)
-                    ws_ws = ws_result['cn']['st']['rt'][0]['ws']
-                    str_result = []
-                    for ws_item in ws_ws:
-                        cw = ws_item['cw'][0]['w']
-                        str_result.append(cw)
-                    transcription = ''.join(str_result)
-                    if transcription:
-                        rospy.loginfo(f"识别结果: {transcription}")
-                        self.publish_callback(transcription)
-
-        elif result_dict.get("action") == "error":
-            rospy.logerr(f"识别错误: {message}")
-            self.close()
-
-    def on_error(self, ws, error):
-        rospy.logerr(f"WebSocket错误: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        rospy.loginfo("WebSocket连接已关闭。")
-
-    def send_audio(self, audio_data):
-        """ 发送音频数据到WebSocket """
-        if self.ws and self.ws.sock and self.ws.sock.connected:
-            try:
-                self.ws.send(audio_data, opcode=websocket.ABNF.OPCODE_BINARY)
-            except Exception as e:
-                rospy.logerr(f"发送音频数据失败: {e}")
-        else:
-            rospy.logwarn("WebSocket未连接，无法发送音频数据。")
-
-    def send_end_tag(self):
-        """ 发送结束标志 """
-        if self.ws and self.ws.sock and self.ws.sock.connected:
-            try:
-                self.ws.send(end_tag.encode('utf-8'), opcode=websocket.ABNF.OPCODE_TEXT)
-                rospy.loginfo("发送结束标志成功。")
-            except Exception as e:
-                rospy.logerr(f"发送结束标志失败: {e}")
-
-    def close(self):
-        """ 关闭WebSocket连接 """
-        if self.ws:
-            self.ws.close()
-        if self.thread:
-            self.thread.join()
-        rospy.loginfo("WebSocket连接已关闭。")
-
-class RecognizerNode:
-    """ ROS节点，使用科大讯飞的语音识别API进行语音转文字。 """
+class Recognizer(object):
+    """ 基于 Whisper 的语音识别器。 """
 
     def __init__(self):
-        # 初始化ROS节点
+        # 启动节点
         rospy.init_node("recognizer")
-
-        # 参数名称
-        self._device_name_param = "~mic_name"
-        self._appid_param = "~appid"
-        self._api_key_param = "~api_key"
-        self._api_secret_param = "~api_secret"
-
-        # 获取AppID、API Key和API Secret
-        if rospy.has_param(self._appid_param) and rospy.has_param(self._api_key_param) and rospy.has_param(self._api_secret_param):
-            self.appid = rospy.get_param(self._appid_param)
-            self.api_key = rospy.get_param(self._api_key_param)
-            self.api_secret = rospy.get_param(self._api_secret_param)
-        else:
-            rospy.logerr("AppID、API Key和API Secret参数未设置。请设置~appid、~api_key和~api_secret参数。")
-            raise Exception("AppID、API Key和API Secret参数未设置。")
-
-        # 配置麦克风
+        self._device_name_param = "~mic_name"  # 通过 pacmd list-sources 查找你的麦克风名称
+        # 使用 GStreamer 启动配置配置麦克风
         if rospy.has_param(self._device_name_param):
             self.device_name = rospy.get_param(self._device_name_param)
             self.device_index = self.pulse_index_from_name(self.device_name)
-            self.launch_config = f"pulsesrc device={self.device_index}"
-            rospy.loginfo(f"使用麦克风设备: pulsesrc device={self.device_index} name={self.device_name}")
+            self.launch_config = "pulsesrc device=" + str(self.device_index)
+            rospy.loginfo("Using: pulsesrc device=%s name=%s", self.device_index, self.device_name)
         elif rospy.has_param('~source'):
-            # 常见源: 'alsasrc'
+            # 常用源: 'alsasrc'
             self.launch_config = rospy.get_param('~source')
         else:
             self.launch_config = 'autoaudiosrc'
-
-        rospy.loginfo(f"GStreamer配置: {self.launch_config}")
-
-        # 配置GStreamer管道以输出原始音频到appsink
+        rospy.loginfo("Launch config: %s", self.launch_config)
+        # 配置 GStreamer 管道以将原始音频输出到 appsink
         self.launch_config += (
             " ! audioconvert ! audioresample "
             "! audio/x-raw,format=S16LE,channels=1,rate=16000 "
             "! appsink name=asr emit-signals=true sync=false max-buffers=1 drop=true"
         )
-
-        # 配置ROS设置
+        # 配置 ROS 设置
         self.started = False
         rospy.on_shutdown(self.shutdown)
         self.pub = rospy.Publisher('~output', String, queue_size=10)
         rospy.Service("~start", Empty, self.start)
         rospy.Service("~stop", Empty, self.stop)
 
-        # 初始化科大讯飞语音识别
-        rospy.loginfo("初始化科大讯飞语音识别客户端...")
-        self.xfyun_recognizer = IFLYTEKSpeechRecognizer(
-            self.appid,
-            self.api_key,
-            self.api_secret,
-            self.publish_result  # 回调函数
-        )
-        self.ws_thread = None
+        # 初始化 Whisper 模型和处理器
+        rospy.loginfo("Loading Whisper model...")
+        self.processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+        self.model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+        self.model.eval()
+        if torch.cuda.is_available():
+            self.model.to('cuda')
+            rospy.loginfo("Whisper model loaded on CUDA.")
+        else:
+            rospy.loginfo("Whisper model loaded on CPU.")
+        
+        # 初始化音频缓冲区
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.buffer_lock = GObject.MainContext()
+        self.max_buffer_size = 16000 * 5  # 5秒的音频数据
 
-    def publish_result(self, transcription):
-        """ 发布识别结果到ROS话题 """
-        msg = String()
-        msg.data = transcription
-        rospy.loginfo(f"发布识别结果: {msg.data}")
-        self.pub.publish(msg)
+        self.start_recognizer()
 
     def start_recognizer(self):
-        rospy.loginfo("启动识别器... ")
-
+        rospy.loginfo("Starting recognizer... ")
         self.pipeline = gst.parse_launch(self.launch_config)
         self.appsink = self.pipeline.get_by_name('asr')
         self.appsink.connect('new-sample', self.on_new_sample)
-
         self.pipeline.set_state(gst.State.PLAYING)
         self.started = True
-        rospy.loginfo("识别器已启动，管道正在播放。")
+        rospy.loginfo("Recognizer started and pipeline is PLAYING.")
 
     def pulse_index_from_name(self, name):
-        """ 根据设备名称获取Pulse index """
-        try:
-            output = os.popen(
-                f"pacmd list-sources | grep -B 1 'name: <{name}>' | grep -o -P '(?<=index: )[0-9]*'"
-            ).read().strip()
-            if output.isdigit():
-                return int(output)
-            else:
-                raise Exception(f"错误。该名称的Pulse index不存在: {name}")
-        except Exception as e:
-            rospy.logerr(str(e))
-            raise
+        output = os.popen(
+            "pacmd list-sources | grep -B 1 'name: <" + name + ">' | grep -o -P '(?<=index: )[0-9]*'"
+        ).read().strip()
+        if output.isdigit():
+            return int(output)
+        else:
+            raise Exception("Error. Pulse index doesn't exist for name: " + name)
 
     def stop_recognizer(self):
         if self.started:
-            # 发送结束标志
-            self.xfyun_recognizer.send_end_tag()
-            # 关闭WebSocket连接
-            self.xfyun_recognizer.close()
-            if self.ws_thread is not None:
-                self.ws_thread.join()
-                self.ws_thread = None
-
-            # 关闭GStreamer管道
             self.pipeline.set_state(gst.State.NULL)
             self.pipeline = None
             self.appsink = None
             self.started = False
-            rospy.loginfo("识别器已停止，管道已关闭。")
+            rospy.loginfo("Recognizer stopped and pipeline is NULL.")
 
     def shutdown(self):
-        """ 删除任何剩余的参数以避免影响下次启动 """
-        for param in [self._device_name_param, self._appid_param, self._api_key_param, self._api_secret_param]:
+        """ 删除任何剩余的参数以免影响下次启动 """
+        for param in [self._device_name_param]:
             if rospy.has_param(param):
                 rospy.delete_param(param)
 
-        """ 关闭GTK线程。 """
+        """ 关闭 GTK 线程。 """
         gtk.main_quit()
 
     def start(self, req):
         if not self.started:
             self.start_recognizer()
-            rospy.loginfo("通过服务启动识别器。")
+            rospy.loginfo("Recognizer started via service.")
         else:
-            rospy.loginfo("识别器已在运行。")
+            rospy.loginfo("Recognizer is already running.")
         return EmptyResponse()
 
     def stop(self, req):
         if self.started:
             self.stop_recognizer()
-            rospy.loginfo("通过服务停止识别器。")
+            rospy.loginfo("Recognizer stopped via service.")
         else:
-            rospy.loginfo("识别器未在运行。")
+            rospy.loginfo("Recognizer is not running.")
         return EmptyResponse()
 
     def on_new_sample(self, sink):
         sample = sink.emit("pull-sample")
         buf = sample.get_buffer()
         caps = sample.get_caps()
-        # 提取音频数据
+        # 从缓冲区提取音频数据
         array = self.buffer_to_array(buf, caps)
         if array is not None:
-            # 将音频数据发送到科大讯飞语音识别
-            audio_bytes = (array * 32768).astype(np.int16).tobytes()
-            self.xfyun_recognizer.send_audio(audio_bytes)
+            # 累积音频数据
+            self.audio_buffer = np.concatenate((self.audio_buffer, array))
+            rospy.logdebug("Accumulated audio buffer size: %d", len(self.audio_buffer))
+            # 检查是否已经累积了足够的音频数据
+            if len(self.audio_buffer) >= self.max_buffer_size:
+                transcription = self.transcribe(self.audio_buffer)
+                if transcription:
+                    msg = String()
+                    msg.data = transcription
+                    rospy.loginfo("Transcription: %s", msg.data)
+                    self.pub.publish(msg)
+                # 清空缓冲区
+                self.audio_buffer = np.array([], dtype=np.float32)
         return Gst.FlowReturn.OK
 
     def buffer_to_array(self, buf, caps):
         # 获取缓冲区数据
         result, map_info = buf.map(Gst.MapFlags.READ)
         if not result:
-            rospy.logwarn("无法映射缓冲区数据。")
+            rospy.logwarn("Failed to map buffer data.")
             return None
-
         # 提取音频格式信息
         structure = caps.get_structure(0)
         rate = structure.get_value('rate')
         channels = structure.get_value('channels')
         format = structure.get_value('format')
-
-        # 假设为S16LE格式
+        # 假设 S16LE 格式
         if format != 'S16LE' or channels != 1 or rate != 16000:
-            rospy.logwarn(f"意外的音频格式: {format}, 通道数: {channels}, 采样率: {rate}")
+            rospy.logwarn("Unexpected audio format: %s, channels: %d, rate: %d", format, channels, rate)
             buf.unmap(map_info)
             return None
-
-        # 将缓冲区转换为numpy数组
+        # 将缓冲区转换为 numpy 数组
         audio_data = np.frombuffer(map_info.data, dtype=np.int16).astype(np.float32) / 32768.0
         buf.unmap(map_info)
         return audio_data
 
+    def transcribe(self, audio_array):
+        try:
+            # 准备 Whisper 的输入
+            inputs = self.processor(audio_array, sampling_rate=16000, return_tensors="pt", language="en", task="transcribe")
+            input_features = inputs.input_features
+            if torch.cuda.is_available():
+                input_features = input_features.to('cuda')
+            # 生成转录
+            predicted_ids = self.model.generate(input_features, max_length=448)
+            transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            return transcription
+        except Exception as e:
+            rospy.logerr("Error during transcription: %s", str(e))
+            return None
+
 if __name__ == "__main__":
-    try:
-        node = RecognizerNode()
-        gtk.main()
-    except rospy.ROSInterruptException:
-        pass
+    recognizer = Recognizer()
+    gtk.main()
