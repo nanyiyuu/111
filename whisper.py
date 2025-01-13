@@ -1,166 +1,199 @@
 #!/usr/bin/env python3
 
 """
-whisper_realtime_recognizer.py is a ROS node that captures audio in real-time,
-processes it using the Whisper model, and publishes the transcription.
-
-Parameters:
-  ~lm - (Not required for Whisper)
-  ~dict - (Not required for Whisper)
-  ~hmm - (Not required for Whisper)
-  ~mic_name - name of the microphone device (optional)
-
-Publications:
-  ~output (std_msgs/String) - transcribed text
-
-Services:
-  ~start (std_srvs/Empty) - start transcription
-  ~stop (std_srvs/Empty) - stop transcription
+recognizer.py is a wrapper for Whisper-based speech recognition.
+  parameters:
+    ~mic_name - set the pulsesrc device name for the microphone input.
+                e.g. a Logitech G35 Headset has the following device name: alsa_input.usb-Logitech_Logitech_G35_Headset-00-Headset_1.analog-mono
+                To list audio device info on your machine, in a terminal type: pacmd list-sources
+  publications:
+    ~output (std_msgs/String) - text output
+  services:
+    ~start (std_srvs/Empty) - start speech recognition
+    ~stop (std_srvs/Empty) - stop speech recognition
 """
 
 import rospy
+
+from gi import pygtkcompat
+import gi
+gi.require_version('Gst', '1.0')
+
+from gi.repository import GObject, Gst
+Gst.init(None)
+gst = Gst
+
+pygtkcompat.enable()
+pygtkcompat.enable_gtk(version='3.0')
+
+import gtk
+
 from std_msgs.msg import String
 from std_srvs.srv import Empty, EmptyResponse
 
-import pyaudio
-import torch
-import threading
-import queue
+import os
+import numpy as np
 
+# Import Whisper dependencies
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+import torch
 
-class WhisperRealTimeRecognizer:
+class recognizer(object):
+    """ Whisper-based speech recognizer. """
+
     def __init__(self):
-        rospy.init_node("whisper_realtime_recognizer")
+        # Start node
+        rospy.init_node("recognizer")
 
-        # ROS Parameters
-        self.mic_name = rospy.get_param("~mic_name", None)  # Optional: specify microphone name
+        self._device_name_param = "~mic_name"  # Find the name of your microphone by typing pacmd list-sources in the terminal
 
-        # Initialize ROS Publisher and Services
+        # Configure mics with GStreamer launch config
+        if rospy.has_param(self._device_name_param):
+            self.device_name = rospy.get_param(self._device_name_param)
+            self.device_index = self.pulse_index_from_name(self.device_name)
+            self.launch_config = "pulsesrc device=" + str(self.device_index)
+            rospy.loginfo("Using: pulsesrc device=%s name=%s", self.device_index, self.device_name)
+        elif rospy.has_param('~source'):
+            # common sources: 'alsasrc'
+            self.launch_config = rospy.get_param('~source')
+        else:
+            self.launch_config = 'autoaudiosrc'
+
+        rospy.loginfo("Launch config: %s", self.launch_config)
+
+        # Configure GStreamer pipeline to output raw audio to appsink
+        self.launch_config += (
+            " ! audioconvert ! audioresample "
+            "! audio/x-raw,format=S16LE,channels=1,rate=16000 "
+            "! appsink name=asr emit-signals=true sync=false max-buffers=1 drop=true"
+        )
+
+        # Configure ROS settings
+        self.started = False
+        rospy.on_shutdown(self.shutdown)
         self.pub = rospy.Publisher('~output', String, queue_size=10)
         rospy.Service("~start", Empty, self.start)
         rospy.Service("~stop", Empty, self.stop)
 
-        # Initialize Whisper Model
+        # Initialize Whisper model and processor
         rospy.loginfo("Loading Whisper model...")
         self.processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
         self.model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-        self.language = "french"  # Set your desired language
+        self.model.eval()
+        if torch.cuda.is_available():
+            self.model.to('cuda')
+            rospy.loginfo("Whisper model loaded on CUDA.")
+        else:
+            rospy.loginfo("Whisper model loaded on CPU.")
 
-        # Audio Parameters
-        self.sample_rate = 16000  # Whisper expects 16kHz
-        self.chunk_size = 1024     # Number of frames per buffer
-        self.format = pyaudio.paInt16
-        self.channels = 1
+    def start_recognizer(self):
+        rospy.loginfo("Starting recognizer... ")
 
-        # Initialize PyAudio
-        self.p = pyaudio.PyAudio()
-        self.stream = None
+        self.pipeline = gst.parse_launch(self.launch_config)
+        self.appsink = self.pipeline.get_by_name('asr')
+        self.appsink.connect('new-sample', self.on_new_sample)
 
-        # Threading
-        self.audio_queue = queue.Queue()
-        self.running = False
-        self.thread = None
+        self.pipeline.set_state(gst.State.PLAYING)
+        self.started = True
+        rospy.loginfo("Recognizer started and pipeline is PLAYING.")
 
-        rospy.on_shutdown(self.shutdown)
+    def pulse_index_from_name(self, name):
+        output = os.popen(
+            "pacmd list-sources | grep -B 1 'name: <" + name + ">' | grep -o -P '(?<=index: )[0-9]*'"
+        ).read().strip()
+
+        if output.isdigit():
+            return int(output)
+        else:
+            raise Exception("Error. Pulse index doesn't exist for name: " + name)
+
+    def stop_recognizer(self):
+        if self.started:
+            self.pipeline.set_state(gst.State.NULL)
+            self.pipeline = None
+            self.appsink = None
+            self.started = False
+            rospy.loginfo("Recognizer stopped and pipeline is NULL.")
+
+    def shutdown(self):
+        """ Delete any remaining parameters so they don't affect next launch """
+        for param in [self._device_name_param]:
+            if rospy.has_param(param):
+                rospy.delete_param(param)
+
+        """ Shutdown the GTK thread. """
+        gtk.main_quit()
 
     def start(self, req):
-        if not self.running:
-            rospy.loginfo("Starting Whisper Real-Time Recognizer...")
-            self.running = True
-            self.thread = threading.Thread(target=self.run)
-            self.thread.start()
+        if not self.started:
+            self.start_recognizer()
+            rospy.loginfo("Recognizer started via service.")
+        else:
+            rospy.loginfo("Recognizer is already running.")
         return EmptyResponse()
 
     def stop(self, req):
-        if self.running:
-            rospy.loginfo("Stopping Whisper Real-Time Recognizer...")
-            self.running = False
-            if self.thread is not None:
-                self.thread.join()
+        if self.started:
+            self.stop_recognizer()
+            rospy.loginfo("Recognizer stopped via service.")
+        else:
+            rospy.loginfo("Recognizer is not running.")
         return EmptyResponse()
 
-    def run(self):
-        # Open audio stream
-        self.stream = self.p.open(format=self.format,
-                                  channels=self.channels,
-                                  rate=self.sample_rate,
-                                  input=True,
-                                  frames_per_buffer=self.chunk_size,
-                                  input_device_index=self.get_device_index())
+    def on_new_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        # Extract audio data from buffer
+        array = self.buffer_to_array(buf, caps)
+        if array is not None:
+            transcription = self.transcribe(array)
+            if transcription:
+                msg = String()
+                msg.data = transcription
+                rospy.loginfo("Transcription: %s", msg.data)
+                self.pub.publish(msg)
+        return Gst.FlowReturn.OK
 
-        rospy.loginfo("Audio stream opened.")
+    def buffer_to_array(self, buf, caps):
+        # Get buffer data
+        result, map_info = buf.map(Gst.MapFlags.READ)
+        if not result:
+            rospy.logwarn("Failed to map buffer data.")
+            return None
 
-        buffer = []
+        # Extract audio format info
+        structure = caps.get_structure(0)
+        rate = structure.get_value('rate')
+        channels = structure.get_value('channels')
+        format = structure.get_value('format')
 
-        while self.running and not rospy.is_shutdown():
-            try:
-                data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                buffer.append(data)
+        # Assuming S16LE format
+        if format != 'S16LE' or channels != 1 or rate != 16000:
+            rospy.logwarn("Unexpected audio format: %s, channels: %d, rate: %d", format, channels, rate)
+            buf.unmap(map_info)
+            return None
 
-                # Process every 5 seconds of audio
-                if len(buffer) * self.chunk_size / self.sample_rate >= 5:
-                    audio_data = b''.join(buffer)
-                    buffer = []
+        # Convert buffer to numpy array
+        audio_data = np.frombuffer(map_info.data, dtype=np.int16).astype(np.float32) / 32768.0
+        buf.unmap(map_info)
+        return audio_data
 
-                    # Convert byte data to numpy array
-                    audio_np = self.byte_to_numpy(audio_data)
+    def transcribe(self, audio_array):
+        try:
+            # Prepare input for Whisper
+            input_features = self.processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features
+            if torch.cuda.is_available():
+                input_features = input_features.to('cuda')
 
-                    # Prepare input for Whisper
-                    input_features = self.processor(audio_np, sampling_rate=self.sample_rate, return_tensors="pt").input_features
-
-                    # Generate transcription
-                    with torch.no_grad():
-                        predicted_ids = self.model.generate(input_features, 
-                                                            forced_decoder_ids=self.processor.get_decoder_prompt_ids(language=self.language, task="transcribe"))
-                    
-                    transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-
-                    if transcription:
-                        msg = String()
-                        msg.data = transcription.lower()
-                        rospy.loginfo(f"Transcription: {msg.data}")
-                        self.pub.publish(msg)
-
-            except Exception as e:
-                rospy.logerr(f"Error in audio processing: {e}")
-                self.running = False
-
-        # Close stream
-        if self.stream is not None:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
-        rospy.loginfo("Audio stream closed.")
-
-    def byte_to_numpy(self, byte_data):
-        import numpy as np
-        audio_np = np.frombuffer(byte_data, dtype=np.int16).astype(np.float32) / 32768.0
-        return audio_np
-
-    def get_device_index(self):
-        if self.mic_name is None:
-            return None  # Use default input device
-
-        device_count = self.p.get_device_count()
-        for i in range(device_count):
-            device_info = self.p.get_device_info_by_index(i)
-            if self.mic_name in device_info['name']:
-                rospy.loginfo(f"Using microphone: {device_info['name']} (Index {i})")
-                return i
-        rospy.logwarn(f"Microphone '{self.mic_name}' not found. Using default device.")
-        return None
-
-    def shutdown(self):
-        rospy.loginfo("Shutting down Whisper Real-Time Recognizer...")
-        self.running = False
-        if self.thread is not None:
-            self.thread.join()
-        if self.stream is not None:
-            self.stream.stop_stream()
-            self.stream.close()
-        self.p.terminate()
+            # Generate transcription
+            predicted_ids = self.model.generate(input_features)
+            transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            return transcription
+        except Exception as e:
+            rospy.logerr("Error during transcription: %s", str(e))
+            return None
 
 if __name__ == "__main__":
-    recognizer = WhisperRealTimeRecognizer()
-    rospy.spin()
+    start = recognizer()
+    gtk.main()
