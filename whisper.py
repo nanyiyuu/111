@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-recognizer.py is a wrapper for Whisper-based speech recognition.
+recognizer.py is a wrapper for Google Speech-to-Text API.
   parameters:
     ~mic_name - set the pulsesrc device name for the microphone input.
                 e.g. a Logitech G35 Headset has the following device name: alsa_input.usb-Logitech_Logitech_G35_Headset-00-Headset_1.analog-mono
@@ -34,12 +34,13 @@ from std_srvs.srv import Empty, EmptyResponse
 import os
 import numpy as np
 
-# Import Whisper dependencies
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-import torch
+# Import Google Cloud Speech dependencies
+from google.cloud import speech
+import queue
+import threading
 
 class recognizer(object):
-    """ Whisper-based speech recognizer. """
+    """ Google Speech-to-Text based speech recognizer. """
 
     def __init__(self):
         # Start node
@@ -75,16 +76,14 @@ class recognizer(object):
         rospy.Service("~start", Empty, self.start)
         rospy.Service("~stop", Empty, self.stop)
 
-        # Initialize Whisper model and processor
-        rospy.loginfo("Loading Whisper model...")
-        self.processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-        self.model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-        self.model.eval()
-        if torch.cuda.is_available():
-            self.model.to('cuda')
-            rospy.loginfo("Whisper model loaded on CUDA.")
-        else:
-            rospy.loginfo("Whisper model loaded on CPU.")
+        # Initialize Google Speech client
+        rospy.loginfo("Initializing Google Speech-to-Text client...")
+        self.client = speech.SpeechClient()
+
+        # Prepare audio buffer and threading
+        self.audio_queue = queue.Queue()
+        self.streaming_thread = None
+        self.streaming = False
 
     def start_recognizer(self):
         rospy.loginfo("Starting recognizer... ")
@@ -96,6 +95,11 @@ class recognizer(object):
         self.pipeline.set_state(gst.State.PLAYING)
         self.started = True
         rospy.loginfo("Recognizer started and pipeline is PLAYING.")
+
+        # Start the streaming recognition in a separate thread
+        self.streaming = True
+        self.streaming_thread = threading.Thread(target=self.stream_recognition)
+        self.streaming_thread.start()
 
     def pulse_index_from_name(self, name):
         output = os.popen(
@@ -109,6 +113,11 @@ class recognizer(object):
 
     def stop_recognizer(self):
         if self.started:
+            self.streaming = False
+            if self.streaming_thread is not None:
+                self.streaming_thread.join()
+                self.streaming_thread = None
+
             self.pipeline.set_state(gst.State.NULL)
             self.pipeline = None
             self.appsink = None
@@ -147,12 +156,7 @@ class recognizer(object):
         # Extract audio data from buffer
         array = self.buffer_to_array(buf, caps)
         if array is not None:
-            transcription = self.transcribe(array)
-            if transcription:
-                msg = String()
-                msg.data = transcription
-                rospy.loginfo("Transcription: %s", msg.data)
-                self.pub.publish(msg)
+            self.audio_queue.put(array)
         return Gst.FlowReturn.OK
 
     def buffer_to_array(self, buf, caps):
@@ -179,20 +183,45 @@ class recognizer(object):
         buf.unmap(map_info)
         return audio_data
 
-    def transcribe(self, audio_array):
-        try:
-            # Prepare input for Whisper
-            input_features = self.processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features
-            if torch.cuda.is_available():
-                input_features = input_features.to('cuda')
+    def stream_recognition(self):
+        """ Stream audio data to Google Speech-to-Text and handle responses """
+        def generator():
+            while self.streaming:
+                try:
+                    audio_chunk = self.audio_queue.get(timeout=1)
+                    # Convert float32 back to int16
+                    int_audio = (audio_chunk * 32768).astype(np.int16).tobytes()
+                    yield speech.StreamingRecognizeRequest(audio_content=int_audio)
+                except queue.Empty:
+                    continue
 
-            # Generate transcription
-            predicted_ids = self.model.generate(input_features)
-            transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-            return transcription
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            language_code="zh-CN",  # 根据需要修改语言代码
+        )
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True
+        )
+
+        try:
+            requests = generator()
+            responses = self.client.streaming_recognize(streaming_config, requests)
+
+            for response in responses:
+                if not self.streaming:
+                    break
+                for result in response.results:
+                    if result.is_final:
+                        transcription = result.alternatives[0].transcript.strip()
+                        if transcription:
+                            msg = String()
+                            msg.data = transcription
+                            rospy.loginfo("Transcription: %s", msg.data)
+                            self.pub.publish(msg)
         except Exception as e:
-            rospy.logerr("Error during transcription: %s", str(e))
-            return None
+            rospy.logerr("Error during Google Speech-to-Text streaming: %s", str(e))
 
 if __name__ == "__main__":
     start = recognizer()
